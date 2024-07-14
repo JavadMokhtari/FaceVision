@@ -4,7 +4,7 @@ from os.path import join
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torchvision.models.vgg import 
+from torchvision.models import resnet34
 
 
 class ImageClassificationBase(nn.Module):
@@ -118,7 +118,7 @@ class OcclusionDetector(ImageClassificationBase):
             if round(result['val_acc'], 2) > best_val_acc:
                 best_val_acc = result['val_acc']
                 torch.save(self.state_dict(),
-                           join(models_dir, f"occlusion_classifier_{self.TRAIN_ID}epoch{epoch+1}.pt"))
+                           join(models_dir, f"occlusion_classifier_{self.TRAIN_ID}epoch{epoch + 1}.pt"))
             if self.early_stopping.early_stop:
                 self.history = history
                 return history
@@ -150,6 +150,7 @@ class OcclusionDetector(ImageClassificationBase):
         plt.grid(True, alpha=0.5)
         plt.savefig(f"training_metrics_{self.TRAIN_ID}.svg")
         plt.show()
+
 
 class EarlyStopping:
     def __init__(self, tolerance=5, min_delta=0):
