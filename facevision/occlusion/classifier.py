@@ -4,7 +4,9 @@ from os.path import join
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torchvision.models import resnet34
+from torchvision.models import resnet50
+
+from facevision.models.inception_resnet_v1 import InceptionResnetV1
 
 
 class ImageClassificationBase(nn.Module):
@@ -41,21 +43,44 @@ class ImageClassificationBase(nn.Module):
         return torch.tensor(torch.sum(preds == labels).item() / len(preds))
 
 
-class OcclusionDetector(ImageClassificationBase):
-    def __init__(self, num_classes: int):
+class OcclusionClassifier(ImageClassificationBase):
+    def __init__(self):
         from pathlib import Path
         import warnings
         warnings.filterwarnings('ignore')
 
         super().__init__()
 
-        # Use a pretrained model
+        # Use a weights model
         # downloading weights from this model when it was trained on ImageNet dataset
-        # self.network = resnet34(weights=("pretrained", ResNet34_Weights.IMAGENET1K_V1))
-        self.network = resnet34()
-        self.network.load_state_dict(torch.load(Path(__file__).parent / 'pretrained' / "resnet34-b627a593.pth"))
-        # Replace last layer
-        self.network.fc = nn.Linear(self.network.fc.in_features, num_classes)
+        # self.network = resnet34(weights=("weights", ResNet34_Weights.IMAGENET1K_V1))
+
+        root = Path(__file__).parent.parent.parent
+        RESNET_WEIGHTS_PATH = root / "assets/weights/resnet50-11ad3fa6.pth"
+        INCEPTIONRESNET_WEIGHTS_PATH = root / "assets/weights/20180402-114759-vggface2.pt"
+        DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+        # Load pre-trained ResNet50
+        self.resnet = resnet50()
+        self.resnet.load_state_dict(torch.load(RESNET_WEIGHTS_PATH))
+
+        # Freeze pre-trained layers
+        for param in self.resnet.parameters():
+            param.requires_grad = False
+
+        # Adding a fully connected layer to ResNet50 with size 512
+        self.resnet.last_fc = nn.Linear(self.resnet.fc.out_features, out_features=512)
+
+        # Loading InceptionResNetV1 model
+        self.inception_resnet = InceptionResnetV1(weights=INCEPTIONRESNET_WEIGHTS_PATH, dropout_prob=0.5, device=DEVICE)
+
+        # Freeze pre-trained layers
+        for param in self.inception_resnet.parameters():
+            param.requires_grad = False
+
+        # Adding a fully connected layer to model with size 512
+        self.inception_resnet.fc = nn.Linear(self.inception_resnet.logits.out_features, 512)
+
         self.early_stopping = EarlyStopping(tolerance=5, min_delta=0.2)
         self.history = None
         self.TRAIN_ID = None
@@ -166,3 +191,6 @@ class EarlyStopping:
                 self.early_stop = True
         else:
             self.counter = 0
+
+
+OcclusionClassifier()
