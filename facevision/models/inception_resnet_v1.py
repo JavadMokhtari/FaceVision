@@ -277,4 +277,5 @@ class InceptionResnetV1(nn.Module):
         x = self.last_linear(x.view(x.shape[0], -1))
         x = self.last_bn(x)
         x = F.normalize(x, p=2, dim=1)
+        # x = self.logits(x)
         return x
