@@ -1,64 +1,29 @@
-from typing import Dict, Any
+from typing import Dict, Optional
 from os.path import join
+from time import time
 
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
 from torchvision.models import resnet50
 
 from facevision.models.inception_resnet_v1 import InceptionResnetV1
 
 
-class ImageClassificationBase(nn.Module):
-    def training_step(self, batch) -> torch.Tensor:
-        images, labels = batch
-        out = self(images)  # Generate predictions
-        loss = F.cross_entropy(out, labels)  # Calculate loss
-        return loss
-
-    def validation_step(self, batch) -> Dict[str, torch.Tensor]:
-        images, labels = batch
-        out = self(images)  # Generate predictions
-        loss = F.cross_entropy(out, labels)  # Calculate loss
-        acc = self.accuracy(out, labels)  # Calculate accuracy
-        return {'val_loss': loss.detach(), 'val_acc': acc}
-
-    @staticmethod
-    def validation_epoch_end(outputs) -> Dict[str, float | int | bool]:
-        batch_losses = [x['val_loss'] for x in outputs]
-        epoch_loss = torch.stack(batch_losses).mean()  # Combine losses
-        batch_accs = [x['val_acc'] for x in outputs]
-        epoch_acc = torch.stack(batch_accs).mean()  # Combine accuracies
-        return {'val_loss': epoch_loss.item(), 'val_acc': epoch_acc.item()}
-
-    @staticmethod
-    def epoch_end(epoch, result) -> None:
-        print(f"""Epoch [{epoch + 1}], {f"last_lr: {result['lrs'][-1]:.5f}," if 'lrs' in result else ''}, train_loss:"""
-              f" {result['train_loss']:.4f}, val_loss: {result['val_loss']:.4f}, val_acc: {result['val_acc']:.4f}")
-
-    @staticmethod
-    def accuracy(outputs: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        # Get max value and its index from output tensor
-        _, preds = torch.max(outputs, dim=1)
-        return torch.tensor(torch.sum(preds == labels).item() / len(preds))
-
-
-class OcclusionClassifier(ImageClassificationBase):
-    def __init__(self):
+class OcclusionClassifier(nn.Module):
+    def __init__(self, num_classes: int, pretrained: bool = True, model_path: Optional[str] = None):
         from pathlib import Path
         import warnings
         warnings.filterwarnings('ignore')
 
         super().__init__()
 
-        # Use a weights model
-        # downloading weights from this model when it was trained on ImageNet dataset
-        # self.network = resnet34(weights=("weights", ResNet34_Weights.IMAGENET1K_V1))
-
         root = Path(__file__).parent.parent.parent
         RESNET_WEIGHTS_PATH = root / "assets/weights/resnet50-11ad3fa6.pth"
         INCEPTIONRESNET_WEIGHTS_PATH = root / "assets/weights/20180402-114759-vggface2.pt"
-        DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
         # Load pre-trained ResNet50
         self.resnet = resnet50()
@@ -72,7 +37,8 @@ class OcclusionClassifier(ImageClassificationBase):
         self.resnet.last_fc = nn.Linear(self.resnet.fc.out_features, out_features=512)
 
         # Loading InceptionResNetV1 model
-        self.inception_resnet = InceptionResnetV1(weights=INCEPTIONRESNET_WEIGHTS_PATH, dropout_prob=0.5, device=DEVICE)
+        self.inception_resnet = InceptionResnetV1(
+            weights=INCEPTIONRESNET_WEIGHTS_PATH, dropout_prob=0.5, device=self.device)
 
         # Freeze pre-trained layers
         for param in self.inception_resnet.parameters():
@@ -81,88 +47,130 @@ class OcclusionClassifier(ImageClassificationBase):
         # Adding a fully connected layer to model with size 512
         self.inception_resnet.fc = nn.Linear(self.inception_resnet.logits.out_features, 512)
 
+        # Define 3 last fully connected layers
+        self.lin1 = nn.Linear(1024, 512)
+        self.lin2 = nn.Linear(512, 256)
+        self.bn1 = nn.BatchNorm1d(512)
+        self.bn2 = nn.BatchNorm1d(256)
+        self.out = nn.Linear(256, num_classes)
+
+        if pretrained:
+            self.load_state_dict(model_path)
+
         self.early_stopping = EarlyStopping(tolerance=5, min_delta=0.2)
-        self.history = None
-        self.TRAIN_ID = None
+        self.history = {'train': {'loss': [], 'acc': []},
+                        'val': {'loss': [], 'acc': []}}
 
     def forward(self, xb):
-        return self.network(xb)
+        resnet_out = self.resnet(xb)
+        inception_out = self.inception_resnet(xb)
+        in_features = torch.cat(resnet_out, inception_out)
+        out = self.lin1(in_features)
+        out = F.relu(out)
+        out = self.bn1(out)
+        out = self.lin2(out)
+        out = F.relu(out)
+        out = self.bn2(out)
+        out = self.out(out)
+        out = F.softmax(out, dim=1)
+        return out
 
-    @staticmethod
-    @torch.no_grad()
-    def evaluate_validation(model, val_loader) -> Dict[str, Any]:
-        model.eval()
-        outputs = [model.validation_step(batch) for batch in val_loader]
-        return model.validation_epoch_end(outputs)
-
-    def fit(self, epochs: int, max_lr: float, train_loader,
-            val_loader, weight_decay=0, grad_clip=None,
-            opt_func=torch.optim.SGD) -> list[dict[str, Any]]:
-
+    def fit(self, dataloaders: Dict[str, DataLoader], criterion, optimizer, scheduler, num_epochs=25):
+        """
+        Support function for model training.
+  
+        Args:
+          self: Model to be trained
+          dataloaders:
+          criterion: Optimization criterion (loss)
+          optimizer: Optimizer to use for training
+          scheduler: Instance of ``torch.optim.lr_scheduler``
+          num_epochs: Number of epochs
+        """
         from os import makedirs
-        from time import time
 
-        torch.cuda.empty_cache()
-        history = []
-        best_val_acc = 0
-        self.TRAIN_ID = str(int(time()))
-        models_dir = join(".training_checkpoints", self.TRAIN_ID)
-        makedirs(models_dir, exist_ok=True)
+        since = time()
+        # best_model_wts = copy.deepcopy(self.state_dict())
+        best_acc = 0.0
+        makedirs(".training_checkpoints", exist_ok=True)
+        MODEL_PATH = join(".training_checkpoints", f"occlusion_classifier_best_weights.pt")
 
-        # Set up custom optimizer with weight decay
-        optimizer = opt_func(self.parameters(), max_lr, weight_decay=weight_decay)
-        # Set up one-cycle learning rate scheduler
-        sched = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr, epochs=epochs, steps_per_epoch=len(train_loader))
+        for epoch in range(num_epochs):
+            print(f"Epoch {epoch + 1}/{num_epochs}")
+            print('-' * 10)
 
-        for epoch in range(epochs):
-            # Training Phase
-            self.train()
-            train_losses = []
-            lrs = []
-            for batch in train_loader:
-                loss = self.training_step(batch)
-                train_losses.append(loss)
-                loss.backward()
+            # Each epoch has a training and validation phase
+            for phase in ['train', 'val']:
+                match phase:
+                    case 'train':
+                        self.train()  # Set model to training mode
+                    case 'val':
+                        self.eval()  # Set model to evaluate mode
 
-                # Gradient clipping
-                if grad_clip:
-                    nn.utils.clip_grad_value_(self.parameters(), grad_clip)
-                optimizer.step()
-                optimizer.zero_grad()
+                running_loss = 0.0
+                running_corrects = 0
 
-                # Record & update learning rate
-                lrs.append(optimizer.param_groups[0]['lr'])
-                sched.step()
-            # Validation phase
-            result = self.evaluate_validation(self, val_loader)
-            result['train_loss'] = torch.stack(train_losses).mean().item()
-            result['lrs'] = lrs
-            self.early_stopping(result['train_loss'], result['val_loss'])
-            self.epoch_end(epoch, result)
-            history.append(result)
-            if round(result['val_acc'], 2) > best_val_acc:
-                best_val_acc = result['val_acc']
-                torch.save(self.state_dict(),
-                           join(models_dir, f"occlusion_classifier_{self.TRAIN_ID}epoch{epoch + 1}.pt"))
-            if self.early_stopping.early_stop:
-                self.history = history
-                return history
-        self.history = history
-        return history
+                # Iterate over data.
+                for inputs, labels in dataloaders[phase]:
+                    inputs = inputs.to(self.device)
+                    labels = labels.to(self.device)
+
+                    # zero the parameter gradients
+                    optimizer.zero_grad()
+
+                    # forward
+                    # track history if only in train
+                    with torch.set_grad_enabled(phase == 'train'):
+                        outputs = self(inputs)
+                        _, preds = torch.max(outputs, 1)
+                        loss = criterion(outputs, labels)
+
+                        # backward + optimize only if in training phase
+                        if phase == 'train':
+                            loss.backward()
+                            optimizer.step()
+
+                    # statistics
+                    running_loss += loss.item() * inputs.size(0)
+                    running_corrects += torch.sum(preds == labels.data)
+                if phase == 'train':
+                    scheduler.step()
+
+                epoch_loss = running_loss / len(dataloaders[phase])
+                epoch_acc = running_corrects / len(dataloaders[phase])
+
+                print(f"{phase} Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}")
+                self.history[phase]['loss'].append(epoch_loss)
+                self.history[phase]['acc'].append(epoch_acc)
+
+                # deep copy the model
+                if phase == 'val' and epoch_acc > best_acc:
+                    best_acc = epoch_acc
+                    torch.save(self.state_dict(), MODEL_PATH)
+
+            self.early_stopping(self.history['train']['loss'], self.history['val']['loss'])
+            if self.early_stopping.stop_flag:
+                break
+            print()
+
+        time_elapsed = time() - since
+        print(f'Training complete in {time_elapsed // 60:.0f}m {time_elapsed % 60:.0f}s')
+        print(f'Best val Acc: {best_acc:4f}')
+
+        # load best model weights
+        self.load_state_dict(MODEL_PATH)
+        return self.history
 
     def plot_history(self):
         import matplotlib.pyplot as plt
 
         fig, ax = plt.subplots()
-        n_epochs = len(self.history)
+        x_range = list(range(1, len(self.history['train']['loss']) + 1))
 
-        train_losses = [res['train_loss'] for res in self.history]
-        val_losses = [res['val_loss'] for res in self.history]
-        val_accuracy = [res['val_acc'] for res in self.history]
-
-        ax.plot(list(range(1, n_epochs + 1)), train_losses, label='Train Loss', color='blue')
-        ax.plot(list(range(1, n_epochs + 1)), val_losses, label='Validation Loss', color='red')
-        ax.plot(list(range(1, n_epochs + 1)), val_accuracy, label='Validation Accuracy', color='green')
+        ax.plot(x_range, self.history['train']['loss'], label='Train Loss', color='blue')
+        ax.plot(x_range, self.history['val']['loss'], label='Validation Loss', color='red')
+        ax.plot(x_range, self.history['train']['acc'], label='Train Accuracy', color='purple')
+        ax.plot(x_range, self.history['val']['acc'], label='Validation Accuracy', color='green')
 
         # Customize the plot
         ax.set_xlabel('Epochs')
@@ -182,15 +190,12 @@ class EarlyStopping:
         self.tolerance = tolerance
         self.min_delta = min_delta
         self.counter = 0
-        self.early_stop = False
+        self.stop_flag = False
 
-    def __call__(self, train_loss, validation_loss):
-        if (validation_loss - train_loss) > self.min_delta:
+    def __call__(self, train_loss, val_loss):
+        if (val_loss - train_loss) > self.min_delta:
             self.counter += 1
             if self.counter >= self.tolerance:
-                self.early_stop = True
+                self.stop_flag = True
         else:
             self.counter = 0
-
-
-OcclusionClassifier()
