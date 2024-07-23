@@ -2,10 +2,12 @@ from typing import Dict, Optional
 from os.path import join
 from time import time
 
+import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
 from torchvision.models import resnet50
+from torchvision import transforms
 
 from facevision.models.inception_resnet_v1 import InceptionResnetV1
 from facevision.occlusion.utils import EarlyStopping
@@ -29,7 +31,7 @@ class OcclusionClassifier(nn.Module):
         self.resnet = resnet50()
         self.resnet.load_state_dict(torch.load(RESNET_WEIGHTS_PATH))
 
-        # Freeze pre-trained layers
+        # Freeze pre-trained layers of ResNet
         # for param in self.resnet.parameters():
         #     param.requires_grad = False
 
@@ -37,25 +39,27 @@ class OcclusionClassifier(nn.Module):
         self.inception_resnet = InceptionResnetV1(
             weights=INCEPTIONRESNET_WEIGHTS_PATH, dropout_prob=0.5, device=self.device)
 
-        # Freeze pre-trained layers
+        # Freeze pre-trained layers of Inception ResNet
         # for param in self.inception_resnet.parameters():
         #     param.requires_grad = False
 
         # Adding a fully connected layer to ResNet50 with size 512
-        self.resnet_fx = nn.Linear(self.resnet.fc.out_features, out_features=256)
+        self.resnet_fx = nn.Linear(self.resnet.fc.out_features, out_features=512)
 
         # Adding a fully connected layer to model with size 512
-        self.inceptionResnet_fx = nn.Linear(self.inception_resnet.last_bn.num_features, 256)
+        self.inceptionResnet_fx = nn.Linear(self.inception_resnet.last_bn.num_features, 512)
 
         # Define 3 last fully connected layers
-        self.lin1 = nn.Linear(512, 256)
-        self.lin2 = nn.Linear(256, 128)
-        self.bn1 = nn.BatchNorm1d(256)
-        self.bn2 = nn.BatchNorm1d(128)
+        self.lin1 = nn.Linear(self.resnet_fx.out_features + self.inceptionResnet_fx.out_features, 512)
+        self.lin2 = nn.Linear(512, 256)
+        self.lin3 = nn.Linear(256, 128)
+        self.bn1 = nn.BatchNorm1d(512)
+        self.bn2 = nn.BatchNorm1d(256)
+        self.bn3 = nn.BatchNorm1d(128)
         self.out = nn.Linear(128, num_classes)
 
         if pretrained:
-            self.load_state_dict(model_path)
+            self.load_state_dict(torch.load(model_path))
 
         self.early_stopping = EarlyStopping(tolerance=5, min_delta=0.2)
         self.history = {'train': {'loss': [], 'acc': []},
@@ -77,6 +81,9 @@ class OcclusionClassifier(nn.Module):
         out = self.lin2(out)
         out = F.relu(out)
         out = self.bn2(out)
+        out = self.lin3(out)
+        out = F.relu(out)
+        out = self.bn3(out)
         out = self.out(out)
         out = F.softmax(out, dim=1)
         return out
@@ -98,12 +105,11 @@ class OcclusionClassifier(nn.Module):
         since = time()
         best_acc = 0.0
         makedirs(".training_checkpoints", exist_ok=True)
-        MODEL_PATH = join(".training_checkpoints", f"occlusion_classifier_best_weights.pt")
 
         for epoch in range(num_epochs):
             print(f"Epoch {epoch + 1}/{num_epochs}")
-            print('-' * 10)
 
+            start = time()
             # Each epoch has a training and validation phase
             for phase in ['train', 'val']:
                 match phase:
@@ -141,8 +147,8 @@ class OcclusionClassifier(nn.Module):
                 if phase == 'train':
                     scheduler.step()
 
-                epoch_loss = running_loss / len(dataloaders[phase])
-                epoch_acc = running_corrects / len(dataloaders[phase])
+                epoch_loss = running_loss / len(dataloaders[phase].dataset)
+                epoch_acc = running_corrects / len(dataloaders[phase].dataset)
 
                 print(f"{phase} Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}")
                 self.history[phase]['loss'].append(epoch_loss)
@@ -151,19 +157,24 @@ class OcclusionClassifier(nn.Module):
                 # deep copy the model
                 if phase == 'val' and epoch_acc > best_acc:
                     best_acc = epoch_acc
+                    MODEL_PATH = join(".training_checkpoints", f"occlusion_classifier_{str(best_acc)[2:]}.pt")
                     torch.save(self.state_dict(), MODEL_PATH)
+
+            end = time() - start
+            print(f"Run time: {end:.2f} sec")
+            print('-' * 20)
+            print()
 
             self.early_stopping(self.history['train']['loss'][-1], self.history['val']['loss'][-1])
             if self.early_stopping.stop_flag:
                 break
-            print()
 
         time_elapsed = time() - since
         print(f'Training complete in {time_elapsed // 60:.0f}m {time_elapsed % 60:.0f}s')
         print(f'Best val Acc: {best_acc:4f}')
 
         # load best model weights
-        self.load_state_dict(MODEL_PATH)
+        self.load_state_dict(torch.load(MODEL_PATH))
         return self.history
 
     def plot_history(self):
@@ -188,3 +199,18 @@ class OcclusionClassifier(nn.Module):
         plt.grid(True, alpha=0.5)
         plt.savefig(f"training_metrics.svg")
         plt.show()
+
+    def predict(self, face_img: np.ndarray):
+        img_transformer = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Resize((256, 256)),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+        labels = ('bare', 'covered', 'glasses', 'sunglasses')
+        input_face = img_transformer(face_img)
+        input_img = input_face.unsqueeze(0).to(self.device)
+
+        self.eval()
+        pred = torch.max(self(input_img), 1).indices.int()
+        return labels[pred.item()]
