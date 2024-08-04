@@ -1,22 +1,16 @@
 import json
 from os import makedirs
 from pathlib import Path
-from typing import Optional, List, Tuple, Any
+from typing import Optional, List, Any
 
-from PIL import Image
+import cv2
 import numpy as np
 from mediapipe.python.solutions.face_detection import FaceDetection
 from mediapipe.python.solutions.face_mesh import FaceMesh
-# from deepface import DeepFace
-import torch
-from torch.autograd import Variable
-import torch.nn.functional as F
-import cv2
-import scipy.io as scio
 
-from facevision.pose.sixdrepnet import SixDRepNet
-# from fiqa.shufflenetv2 import ShuffleNetV2
-# from fiqa.occlusion_detector import OcclusionDetector
+from facevision.occlusion.classifier import OcclusionClassifier
+from sixdrepnet import SixDRepNet
+from deepface import DeepFace
 
 
 class FaceAnalyzer:
@@ -29,7 +23,7 @@ class FaceAnalyzer:
         """
         self.root_dir = Path(__file__).parent
 
-        self.__image_path = image_path
+        self.image_path = image_path
         self.image = self.__image
         self.bbox = self.__bbox
         self.face = self.__face
@@ -39,6 +33,8 @@ class FaceAnalyzer:
         self.face_detector = FaceDetection(model_selection=0, min_detection_confidence=0.5)
         self.face_mesh = FaceMesh(refine_landmarks=True, min_detection_confidence=0.5)
         self.pose_estimator = SixDRepNet(gpu_id=-1, dict_path='')
+        self.occlusion_classifier = OcclusionClassifier(num_classes=4, pretrained=True,
+                                    model_path="assets/weights/occlusion_classifier_978261.pt")
 
     def set_image(self, img_path: str):
         """
@@ -46,12 +42,49 @@ class FaceAnalyzer:
         Args:
             img_path (str): The path to the new image.
         """
-        self.__image_path = img_path
+        self.image_path = img_path
         self.image = self.__image
         self.bbox = self.__bbox
         self.face = self.__face
         self.head = self.__head
         self.landmark = self.__landmark
+
+    @property
+    def analyze(self):
+        """
+        Returns a dictionary with the quality metrics of the image.
+        The dictionary contains the following keys:
+            - size: The size quality of the image.
+            - sharpness: The sharpness quality of the image.
+            - pose: The pose quality of the image.
+            - illumination: The illumination quality of the image.
+            - occlusions: The occlusion detections in the image.
+        Returns:
+            dict: A dictionary containing the quality metrics of the image.
+        """
+        analysis_res = self.analyze_face()
+        return {
+            "image_size": self.size,
+            "sharpness": self.sharpness,
+            "age": analysis_res['age'],
+            "gender": analysis_res['gender'],
+            "emotion": analysis_res['emotion'],
+            "race": analysis_res['race'],
+            "head_pose": self.pose,
+            # "illumination": self.illumination,
+            "occlusions": self.occlusions
+        }
+
+    def save_quality_results(self, results_dir='results'):
+        """
+        Saves the quality metrics of the image to a JSON file in the specified directory.
+        Args:
+            results_dir (str): The directory where the results will be saved. Default is 'results'.
+        """
+        makedirs(results_dir, exist_ok=True)
+        json_file_name = Path(self.image_path).with_suffix('.json').name
+        with open(Path(results_dir, json_file_name), mode='w') as res_file:
+            json.dump(self.analyze, res_file, indent=4, default=str)
 
     @property
     def __image(self) -> np.ndarray:
@@ -61,7 +94,7 @@ class FaceAnalyzer:
         Returns:
             np.ndarray: The processed image.
         """
-        image = cv2.imread(self.__image_path)
+        image = cv2.imread(self.image_path)
         # image = cv2.flip(image, 1)  # flipped for selfie view
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         return image
@@ -192,3 +225,16 @@ class FaceAnalyzer:
         return {'pitch': str(pitch[0]),
                 'yaw': str(yaw[0]),
                 'roll': str(roll[0])}
+
+    @property
+    def occlusions(self):
+        return self.occlusion_classifier.predict(self.face)
+
+    def verify(self, person: str | np.ndarray | List[float], **kwargs) -> dict[str, Any]:
+        return DeepFace.verify(self.image_path, person, **kwargs)
+
+    def find_face(self, db_dir: str, **kwargs):
+        return DeepFace.find(self.image_path, db_dir, **kwargs)
+
+    def analyze_face(self, **kwargs):
+        return DeepFace.analyze(self.image_path, **kwargs)[0]
