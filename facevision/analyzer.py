@@ -5,12 +5,13 @@ from typing import Optional, List, Any
 
 import cv2
 import numpy as np
+import mediapipe as mp
 from mediapipe.python.solutions.face_detection import FaceDetection
 from mediapipe.python.solutions.face_mesh import FaceMesh
 
 from facevision.occlusion.classifier import OcclusionClassifier
 from sixdrepnet import SixDRepNet
-from deepface import DeepFace
+# from deepface import DeepFace
 
 
 class FaceAnalyzer:
@@ -23,18 +24,17 @@ class FaceAnalyzer:
         """
         self.root_dir = Path(__file__).parent
 
+        self.face_detector = FaceDetection(model_selection=0, min_detection_confidence=0.5)
+        self.face_mesh = FaceMesh(refine_landmarks=True, min_detection_confidence=0.5)
+        self.pose_estimator = SixDRepNet(gpu_id=-1, dict_path='')
+        self.occlusion_classifier = OcclusionClassifier(num_classes=4, pretrained=True,
+                                                        model_path="assets/weights/occlusion_classifier_978261.pt")
         self.image_path = image_path
         self.image = self.__image
         self.bbox = self.__bbox
         self.face = self.__face
         self.head = self.__head
         self.landmark = self.__landmark
-
-        self.face_detector = FaceDetection(model_selection=0, min_detection_confidence=0.5)
-        self.face_mesh = FaceMesh(refine_landmarks=True, min_detection_confidence=0.5)
-        self.pose_estimator = SixDRepNet(gpu_id=-1, dict_path='')
-        self.occlusion_classifier = OcclusionClassifier(num_classes=4, pretrained=True,
-                                    model_path="assets/weights/occlusion_classifier_978261.pt")
 
     def set_image(self, img_path: str):
         """
@@ -64,7 +64,7 @@ class FaceAnalyzer:
         """
         analysis_res = self.analyze_face()
         return {
-            "image_size": self.size,
+            "image_size": self.check_size_standards,
             "sharpness": self.sharpness,
             "age": analysis_res['age'],
             "gender": analysis_res['gender'],
@@ -94,6 +94,7 @@ class FaceAnalyzer:
         Returns:
             np.ndarray: The processed image.
         """
+        # image = mp.Image.create_from_file(self.image_path)
         image = cv2.imread(self.image_path)
         # image = cv2.flip(image, 1)  # flipped for selfie view
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
